@@ -770,7 +770,6 @@ class AnalysisApp(tk.Tk):
 
         matched_rows = []
         for part in raw_parts:
-            # Expected format in Unique ID: DocumentID_FullName or similar
             if "_" in part:
                 doc_part, name_part = part.split("_", 1)
             else:
