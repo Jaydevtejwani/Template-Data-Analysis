@@ -31,7 +31,7 @@ class AnalysisApp(tk.Tk):
         self.selected_col_name = None
         self.active_selection_type = None  # 'row', 'col', or 'cell'
 
-        self.history = []          # Stack of dicts: {'task': ..., 'details': ..., 'undo_df': ..., 'undo_hl': ...}
+        self.history = []          # Stack of dicts for undo
         self.cell_highlights = {}  # Maps (row_idx, col_name) -> hex_color
 
         self._apply_styles()
@@ -72,7 +72,7 @@ class AnalysisApp(tk.Tk):
         ttk.Label(task_frame, text="Select Task By Row:").grid(row=0, column=0, padx=5, sticky=tk.W)
         self.row_task_var = tk.StringVar(value="Choose Task...")
         self.row_task_cb = ttk.Combobox(
-            task_frame, textvariable=self.row_task_var, state="readonly", width=25,
+            task_frame, textvariable=self.row_task_var, state="readonly", width=22,
             values=["Choose Task...", "Highlight Selected Row With Color", "Add Selected Duplicated Row", "Edit Entire Row"]
         )
         self.row_task_cb.grid(row=0, column=1, padx=5)
@@ -82,20 +82,22 @@ class AnalysisApp(tk.Tk):
         ttk.Label(task_frame, text="Select Task By Cell/Column:").grid(row=0, column=2, padx=5, sticky=tk.W)
         self.col_task_var = tk.StringVar(value="Choose Task...")
         self.col_task_cb = ttk.Combobox(
-            task_frame, textvariable=self.col_task_var, state="readonly", width=25,
+            task_frame, textvariable=self.col_task_var, state="readonly", width=22,
             values=["Choose Task...", "Highlight Selected Cell With Color", "Edit Cell", "Delimited Cell Text"]
         )
         self.col_task_cb.grid(row=0, column=3, padx=5)
         self.col_task_cb.bind("<<ComboboxSelected>>", self.handle_col_task)
 
-        # 3. Other Task
+        # 3. Other Task (Includes Analysis Full Data Pop-Up Trigger)
         ttk.Label(task_frame, text="Select Other Task:").grid(row=0, column=4, padx=5, sticky=tk.W)
         self.other_task_var = tk.StringVar(value="Choose Task...")
         self.other_task_cb = ttk.Combobox(
-            task_frame, textvariable=self.other_task_var, state="readonly", width=25,
+            task_frame, textvariable=self.other_task_var, state="readonly", width=24,
             values=[
-                "Choose Task...", "Find Data", "Find & Replace", "Insert Blank Row", 
+                "Choose Task...", "Analysis Full Data", "Find Data", "Find & Replace", "Insert Blank Row", 
                 "Copy Cell Value", "Trim Extra Spaces", "Change Text Case", "CountIf Summary",
+                "Batch: Keep First Pipe Value", "Batch: Keep Second Pipe Value", 
+                "Fill Blank Cells", "Remove Duplicate Rows",
                 "Undo Last Task", "View Task History"
             ]
         )
@@ -253,7 +255,9 @@ class AnalysisApp(tk.Tk):
 
         for col in df.columns:
             tree.heading(col, text=col, command=lambda c=col: self._on_header_click(c))
-            tree.column(col, width=130, anchor=tk.W)
+            max_len = max([len(str(col))] + [len(str(val)) for val in df[col].head(50)], default=10)
+            col_width = max(120, min(max_len * 11, 260))
+            tree.column(col, width=col_width, minwidth=110, anchor=tk.W, stretch=False)
 
         for idx, row in df.iterrows():
             tree.insert("", tk.END, iid=idx, values=list(row))
@@ -593,14 +597,16 @@ class AnalysisApp(tk.Tk):
         ttk.Button(popup, text="Apply Selected Part", command=save).pack(pady=12)
 
     # =========================================================================
-    # 7. OTHER TASK EXECUTORS
+    # 7. OTHER TASK EXECUTORS & ANALYSIS FULL DATA POP-UP
     # =========================================================================
     def handle_other_task(self, event):
         task = self.other_task_var.get()
         if task == "Choose Task...":
             return
 
-        if task == "Find Data":
+        if task == "Analysis Full Data":
+            self._open_analysis_full_data_popup()
+        elif task == "Find Data":
             self._task_find_data()
         elif task == "Find & Replace":
             self._task_find_replace()
@@ -614,12 +620,295 @@ class AnalysisApp(tk.Tk):
             self._task_change_case()
         elif task == "CountIf Summary":
             self._task_count_if()
+        elif task == "Batch: Keep First Pipe Value":
+            self._task_batch_pipe_extract(keep_index=0)
+        elif task == "Batch: Keep Second Pipe Value":
+            self._task_batch_pipe_extract(keep_index=1)
+        elif task == "Fill Blank Cells":
+            self._task_fill_blanks()
+        elif task == "Remove Duplicate Rows":
+            self._task_remove_duplicates()
         elif task == "Undo Last Task":
             self.undo_last_task()
         elif task == "View Task History":
             self._task_view_history()
 
         self.other_task_var.set("Choose Task...")
+
+    def _open_analysis_full_data_popup(self):
+        if self.df_fmt.empty:
+            messagebox.showwarning("No Data", "Please load and configure an Excel workbook first.")
+            return
+
+        popup = tk.Toplevel(self)
+        popup.title("Analysis Full Data & Source Inspection")
+        popup.geometry("1100x650")
+        popup.grab_set()
+
+        # Top Task Menu Frame inside Pop-Up
+        task_menu_frame = ttk.LabelFrame(popup, text="Analysis Tasks Menu", padding=10)
+        task_menu_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(task_menu_frame, text="Select Task:").pack(side=tk.LEFT, padx=5)
+        analysis_task_var = tk.StringVar(value="Choose Task...")
+        analysis_task_cb = ttk.Combobox(
+            task_menu_frame, textvariable=analysis_task_var, state="readonly", width=30,
+            values=["Choose Task...", "Add Row As is it"]
+        )
+        analysis_task_cb.pack(side=tk.LEFT, padx=5)
+
+        # Filter Bar for Pop-Up Treeview
+        filter_frame = ttk.Frame(popup, padding=5)
+        filter_frame.pack(fill=tk.X, padx=10)
+
+        ttk.Label(filter_frame, text="Filter Column:").pack(side=tk.LEFT, padx=2)
+        popup_col_cb = ttk.Combobox(filter_frame, values=list(self.df_fmt.columns), state="readonly", width=18)
+        popup_col_cb.pack(side=tk.LEFT, padx=2)
+        if len(self.df_fmt.columns) > 0:
+            popup_col_cb.set(self.df_fmt.columns[0])
+
+        ttk.Label(filter_frame, text="Search:").pack(side=tk.LEFT, padx=2)
+        popup_search_ent = ttk.Entry(filter_frame, width=18)
+        popup_search_ent.pack(side=tk.LEFT, padx=2)
+
+        display_df = self.df_fmt.copy()
+
+        def apply_popup_filter():
+            nonlocal display_df
+            col = popup_col_cb.get()
+            q = popup_search_ent.get().strip()
+            if col and q:
+                mask = self.df_fmt[col].astype(str).str.contains(q, case=False, regex=False)
+                display_df = self.df_fmt[mask].copy()
+            else:
+                display_df = self.df_fmt.copy()
+            sync_popup_tree(display_df)
+
+        def clear_popup_filter():
+            nonlocal display_df
+            popup_search_ent.delete(0, tk.END)
+            display_df = self.df_fmt.copy()
+            sync_popup_tree(display_df)
+
+        ttk.Button(filter_frame, text="Filter", command=apply_popup_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_frame, text="Clear", command=clear_popup_filter).pack(side=tk.LEFT, padx=2)
+
+        # Treeview Container
+        tree_container = ttk.Frame(popup)
+        tree_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        popup_tree = ttk.Treeview(tree_container, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(tree_container, orient="vertical", command=popup_tree.yview)
+        hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=popup_tree.xview)
+        popup_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        popup_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
+        def sync_popup_tree(df):
+            popup_tree.delete(*popup_tree.get_children())
+            popup_tree["columns"] = list(df.columns)
+            for col in df.columns:
+                popup_tree.heading(col, text=col)
+                popup_tree.column(col, width=130, minwidth=100, anchor=tk.W, stretch=False)
+            for idx, row in df.iterrows():
+                popup_tree.insert("", tk.END, iid=idx, values=list(row))
+
+        sync_popup_tree(display_df)
+
+        # Handle Task Execution within Analysis Pop-Up
+        def execute_analysis_task(event):
+            task_choice = analysis_task_var.get()
+            if task_choice == "Choose Task...":
+                return
+
+            selected = popup_tree.selection()
+            if not selected:
+                messagebox.showwarning("Selection Required", "Please select a row in the Analysis table.", parent=popup)
+                analysis_task_var.set("Choose Task...")
+                return
+
+            row_idx = int(selected[0])
+
+            if task_choice == "Add Row As is it":
+                self._task_add_row_as_is_it(row_idx)
+
+            analysis_task_var.set("Choose Task...")
+
+        analysis_task_cb.bind("<<ComboboxSelected>>", execute_analysis_task)
+
+    def _task_add_row_as_is_it(self, row_idx):
+        """
+        Parses 'Source Unique IDs' from the selected formatted row, extracts 
+        Document ID + Full Name components, looks up matching rows in the Original sheet,
+        and exports them into a brand new sheet named 'As it is Data'.
+        """
+        if "Source Unique IDs" not in self.df_fmt.columns:
+            messagebox.showerror("Missing Column", "The 'Source Unique IDs' column is missing from the Formatted sheet.")
+            return
+
+        unique_ids_val = str(self.df_fmt.at[row_idx, "Source Unique IDs"])
+        if not unique_ids_val.strip():
+            messagebox.showwarning("Empty Value", "The selected row has no 'Source Unique IDs' value to parse.")
+            return
+
+        # Split pipe-separated unique IDs (e.g. "GOL0000100475.xlsx_Hernandez, Adriana | ...")
+        raw_parts = [p.strip() for p in unique_ids_val.split("|") if p.strip()]
+        
+        # Identify possible document/file ID and name columns in the original sheet
+        orig_cols = list(self.df_orig.columns)
+        doc_id_col = next((c for c in orig_cols if "document" in c.lower() or "sheet" in c.lower() or "id" in c.lower()), orig_cols[0] if orig_cols else None)
+        name_col = next((c for c in orig_cols if "name" in c.lower()), orig_cols[1] if len(orig_cols) > 1 else None)
+
+        if not doc_id_col or not name_col:
+            messagebox.showerror("Matching Error", "Could not automatically identify Document ID or Name columns in the Original sheet.")
+            return
+
+        matched_rows = []
+        for part in raw_parts:
+            # Expected format in Unique ID: DocumentID_FullName or similar
+            if "_" in part:
+                doc_part, name_part = part.split("_", 1)
+            else:
+                doc_part, name_part = "", part
+
+            # Search in Original Sheet
+            match = self.df_orig[
+                self.df_orig[doc_id_col].astype(str).str.contains(doc_part.strip(), case=False, regex=False) &
+                self.df_orig[name_col].astype(str).str.contains(name_part.strip(), case=False, regex=False)
+            ]
+            if not match.empty:
+                matched_rows.append(match)
+
+        if not matched_rows:
+            messagebox.showinfo("No Match Found", "No corresponding raw rows were found in the Original data sheet for these Unique IDs.")
+            return
+
+        target_df = pd.concat(matched_rows).drop_duplicates()
+
+        # Save into Workbook as new sheet 'As it is Data' using openpyxl
+        try:
+            wb = openpyxl.load_workbook(self.file_path)
+            sheet_title = "As it is Data"
+            if sheet_title in wb.sheetnames:
+                del wb[sheet_title]
+            
+            ws = wb.create_sheet(title=sheet_title)
+
+            # Write Headers
+            for c_idx, col_name in enumerate(target_df.columns):
+                ws.cell(row=1, column=c_idx + 1, value=col_name)
+
+            # Write Rows
+            for r_idx, (_, row) in enumerate(target_df.iterrows()):
+                for c_idx, val in enumerate(row):
+                    ws.cell(row=r_idx + 2, column=c_idx + 1, value=val)
+
+            wb.save(self.file_path)
+            self.workbook_sheets = wb.sheetnames
+            messagebox.showinfo("Success", f"Created new sheet '{sheet_title}' with {len(target_df)} raw unmerged row(s) successfully saved to workbook.")
+            self.record_task("Add Row As is it", f"Exported {len(target_df)} original unmerged rows into new sheet 'As it is Data'")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to create 'As it is Data' sheet in workbook:\n{e}")
+
+    def _task_batch_pipe_extract(self, keep_index=0):
+        popup = tk.Toplevel(self)
+        title = "Keep First Pipe Value" if keep_index == 0 else "Keep Second Pipe Value"
+        popup.title(title)
+        popup.geometry("380x180")
+        popup.grab_set()
+
+        ttk.Label(popup, text=f"Select Column for {title}:").pack(pady=10)
+        col_cb = ttk.Combobox(popup, values=list(self.df_fmt.columns), state="readonly")
+        col_cb.set(self.df_fmt.columns[0])
+        col_cb.pack(pady=5)
+
+        def execute_extract():
+            col = col_cb.get()
+            undo_df = self.df_fmt.copy()
+            undo_hl = copy.deepcopy(self.cell_highlights)
+
+            changed = 0
+            for r_idx in range(len(self.df_fmt)):
+                orig_val = str(self.df_fmt.at[r_idx, col])
+                if "|" in orig_val:
+                    parts = [p.strip() for p in orig_val.split("|")]
+                    if len(parts) > keep_index:
+                        new_val = parts[keep_index]
+                    else:
+                        new_val = parts[0]
+
+                    if orig_val != new_val:
+                        self.df_fmt.at[r_idx, col] = new_val
+                        self.cell_highlights[(r_idx, col)] = self.AUTO_YELLOW
+                        changed += 1
+
+            self.filtered_df_fmt = self.df_fmt.copy()
+            self._sync_treeview(self.tree_fmt, self.filtered_df_fmt)
+            self.record_task(title, f"Extracted part {keep_index+1} from Column '{col}' ({changed} cells updated & highlighted Yellow)", undo_df, undo_hl)
+            messagebox.showinfo("Success", f"{title} executed on Column '{col}' ({changed} cells updated).")
+            popup.destroy()
+
+        ttk.Button(popup, text="Execute Batch Extract", command=execute_extract).pack(pady=15)
+
+    def _task_fill_blanks(self):
+        popup = tk.Toplevel(self)
+        popup.title("Fill Blank Cells")
+        popup.geometry("380x210")
+        popup.grab_set()
+
+        ttk.Label(popup, text="Target Column:").pack(pady=(10, 2))
+        col_cb = ttk.Combobox(popup, values=list(self.df_fmt.columns), state="readonly")
+        col_cb.set(self.df_fmt.columns[0])
+        col_cb.pack(pady=2)
+
+        ttk.Label(popup, text="Fill Empty Cells With Text:").pack(pady=(8, 2))
+        ent = ttk.Entry(popup, width=30)
+        ent.pack(pady=2)
+
+        def execute_fill():
+            col = col_cb.get()
+            fill_val = ent.get()
+            if not fill_val:
+                return
+
+            undo_df = self.df_fmt.copy()
+            undo_hl = copy.deepcopy(self.cell_highlights)
+
+            changed = 0
+            for r_idx in range(len(self.df_fmt)):
+                curr_val = str(self.df_fmt.at[r_idx, col]).strip()
+                if curr_val == "":
+                    self.df_fmt.at[r_idx, col] = fill_val
+                    self.cell_highlights[(r_idx, col)] = self.AUTO_YELLOW
+                    changed += 1
+
+            self.filtered_df_fmt = self.df_fmt.copy()
+            self._sync_treeview(self.tree_fmt, self.filtered_df_fmt)
+            self.record_task("Fill Blank Cells", f"Filled blanks in Column '{col}' with '{fill_val}' ({changed} cells updated)", undo_df, undo_hl)
+            messagebox.showinfo("Success", f"Filled {changed} empty cell(s) in Column '{col}'.")
+            popup.destroy()
+
+        ttk.Button(popup, text="Fill Blanks", command=execute_fill).pack(pady=15)
+
+    def _task_remove_duplicates(self):
+        undo_df = self.df_fmt.copy()
+        undo_hl = copy.deepcopy(self.cell_highlights)
+
+        before_count = len(self.df_fmt)
+        self.df_fmt.drop_duplicates(inplace=True)
+        self.df_fmt.reset_index(drop=True, inplace=True)
+        after_count = len(self.df_fmt)
+        removed_count = before_count - after_count
+
+        self.filtered_df_fmt = self.df_fmt.copy()
+        self._sync_treeview(self.tree_fmt, self.filtered_df_fmt)
+        self.record_task("Remove Duplicates", f"Removed {removed_count} exact duplicate rows", undo_df, undo_hl)
+        messagebox.showinfo("Success", f"Removed {removed_count} duplicate row(s) successfully.")
 
     def _task_trim_spaces(self):
         popup = tk.Toplevel(self)
@@ -886,7 +1175,7 @@ class AnalysisApp(tk.Tk):
             lb.insert(tk.END, f"[{item['task']}] - {item['details']}")
 
     # =========================================================================
-    # 8. STYLE-PRESERVING EXPORT PIPELINE (EXPORTS WITH YELLOW HIGHLIGHTS)
+    # 8. STYLE-PRESERVING EXPORT PIPELINE
     # =========================================================================
     def export_final_file(self):
         save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Workbooks", "*.xlsx")])
